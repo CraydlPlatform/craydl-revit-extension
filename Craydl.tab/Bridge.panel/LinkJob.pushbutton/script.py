@@ -24,17 +24,9 @@ def main():
     doc = revit.doc
     try:
         host.require_project(doc)
-        plan = params.binding_plan(host.project_parameters(doc))
+        bindings = host.binding_changes(host.project_parameters(doc))
     except Exception as error:
         forms.alert("%s\nNothing was changed." % error, title=TITLE)
-        return
-    missing = [row["name"] for row in plan if row["action"] != "ok"]
-    if missing:
-        forms.alert(
-            "Run Set Up Model first: %s is missing or has a binding conflict.\nNothing was changed."
-            % ", ".join(missing),
-            title=TITLE,
-        )
         return
     try:
         client = host.connected_client()
@@ -134,7 +126,8 @@ def main():
     if choice is None:
         return
     selected = jobs[labels.index(choice)]
-    if selected["id"] == current:
+    same_job = selected["id"] == current
+    if same_job and not bindings:
         forms.alert(
             "This model is already linked to that job. Nothing was changed.",
             title=TITLE,
@@ -146,7 +139,9 @@ def main():
         + "\nID: "
         + selected["id"]
     )
-    if current:
+    if same_job:
+        prompt = "Keep this job link and add the missing fields?\n\n" + current_summary
+    elif current:
         prompt = (
             "Replace the current link?\n\nCurrent job\n"
             + current_summary
@@ -154,6 +149,10 @@ def main():
             + summary(selected)
             + "\nID: "
             + selected["id"]
+        )
+    if bindings:
+        prompt += "\n\nCraydl fields to add or complete: " + ", ".join(
+            row["name"] for row in bindings
         )
     if not forms.alert(
         prompt + "\n\nThis does not save or sync the model.",
@@ -168,6 +167,7 @@ def main():
             raise ValueError(
                 "The job link changed during selection. Run Link Job again."
             )
+        host.bind_missing_parameters(doc, bindings)
         host.write_stamp(doc.ProjectInformation, JOB_GUID, selected["id"])
 
     try:

@@ -56,12 +56,24 @@ def main():
             if mode == "Check this model"
             else check.template_report(snapshot)
         )
-        script.get_output()
-        for line in check.format_report(report, snapshot["model"]["title"]):
+        output = script.get_output()
+        for line in check.summary_lines(report, snapshot["model"]["title"]):
             print(line)
         findings = report["findings"]
+        for finding in findings:
+            for line in check.finding_lines(finding):
+                print(line)
+            ids = finding["element_ids"]
+            if ids:
+                print(
+                    output.linkify(
+                        host_scan.element_ids(ids), title="Select these %s" % len(ids)
+                    )
+                )
+        if not findings:
+            print(check.NO_FINDINGS)
         alert(
-            "%s FIX and %s NOTE findings. See the pyRevit output window for details."
+            "%s to fix and %s to review. See the pyRevit output window for details."
             % (
                 sum(1 for row in findings if row["level"] == "fix"),
                 sum(1 for row in findings if row["level"] == "note"),

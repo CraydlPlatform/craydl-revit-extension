@@ -6,7 +6,7 @@ import json
 
 from craydl_bridge import params, seed
 
-SCHEMA = "craydl.revit.snapshot/1"
+SCHEMA = "craydl.revit.snapshot/2"
 PRODUCT_CATEGORIES = frozenset(
     [
         "OST_PlumbingFixtures",
@@ -24,31 +24,26 @@ PRODUCT_CATEGORIES = frozenset(
         "OST_GenericModel",
     ]
 )
-STARTER_ROOM_NAMES = frozenset(
-    seed.normalize(name)
-    for name in [
-        "Bed 1",
-        "Great Room",
-        "Garage",
-        "Mech.",
-        "Bath 1",
-        "CL",
-    ]
-)
+STARTER_ROOM_NAMES = seed.STARTER_ROOM_NAMES
 _UNUSABLE_NUMBERS = frozenset(["", "na", "none", "notatype", "tbd", "model"])
 
 TEXT = {
-    "not_set_up": "Craydl parameters are not fully bound; run Set Up Model.",
+    "not_set_up": "Craydl parameters are not fully bound; Link Job adds the missing fields.",
     "not_linked": "The model has no valid job ID; use Link Job to link it.",
-    "no_placed_rooms": "No rooms are placed in the chosen phase; place rooms in that phase before seeding them.",
-    "starter_rooms": "Unplaced starter rooms remain; place the rooms you need and remove the leftovers.",
-    "rooms_not_placed": "Other rooms are not placed; place or remove them as appropriate.",
-    "rooms_without_id": "Placed rooms in the chosen phase have no Craydl ID; run Seed Rooms to link them.",
+    "no_placed_rooms": "No room has an area in the chosen phase. Place the rooms that are waiting, or run the check on the phase that holds the rooms.",
+    "starter_rooms": "Starter rooms from the template remain with no area; place the ones you need and remove the leftovers.",
+    "rooms_waiting_to_be_placed": "These rooms already have Craydl IDs but have no area; place them with Revit's Room tool or check their boundaries.",
+    "rooms_not_placed": "These rooms have neither an area nor a Craydl ID and are not template starters; place or enclose the ones you need.",
+    "rooms_without_id": "Placed rooms in the chosen phase have no Craydl ID; run Match Rooms to link each one.",
+    "id_on_unplaced_room": "A Craydl ID sits on a room that is not placed while a placed room has the same name; run Match Rooms to move the ID.",
     "duplicate_room_id": "Room IDs are shared by multiple rooms; resolve the duplicate stamps before sharing data.",
-    "duplicate_room_names": "Placed rooms share a name within a phase; give them distinct names.",
+    "duplicate_room_names": "Placed rooms share a name in the chosen phase; give them distinct names if they represent different rooms.",
     "nothing_in_new_phase": "No items or hosts were created in the chosen phase; check the phase choice and element phases.",
-    "products_outside_rooms": "New products have no room reference; check their placement and room boundaries.",
-    "products_without_number": "New products have no usable model number; add product numbers where known.",
+    "products_on_placeholder_type": "These products were loaded on their placeholder type, so they carry no model number; load the real type from the family's type catalog.",
+    "products_named_without_number": "These products have a maker or link but no usable model number; add the manufacturer's model number where known.",
+    "products_not_identified": "These products have no usable model number, maker or link; add the product details where known.",
+    "custom_items": "These in-place families are not counted as products; review them as custom items.",
+    "products_outside_rooms": "These products have no room reference; review their placement and the room boundaries.",
     "repeated_materials": "Material names are repeated at least a hundred times; review and consolidate redundant materials.",
     "template_linked": "The template carries a job ID; clear it before reusing the template.",
     "template_room_ids": "Template rooms carry Craydl IDs; clear the stamps before reusing the template.",
@@ -57,14 +52,50 @@ TEXT = {
     "template_products": "The template contains products; review and remove project-specific instances.",
 }
 
-_MODEL_LABELS = [
+STAGE_TEXT = {
+    "survey": "This looks like a survey or as-built model; run the check on the phase that holds its rooms and items.",
+    "not_linked": "Run Link Job to link the model and add any missing Craydl fields.",
+    "rooms_to_match": "Use Match Rooms to link the placed rooms without a Craydl ID (%s).",
+    "rooms_to_place": "Use Revit's Room tool to place the Craydl rooms waiting for an area (%s).",
+    "no_rooms": "No rooms are placed or linked yet; draw rooms in Revit or use Match Rooms to bring them in from Craydl.",
+    "ready": "The rooms are matched; review the findings below before sharing.",
+}
+
+LABELS = {
+    "rooms_placed": "Rooms with an area in {phase}",
+    "rooms_placed_other_phases": "Rooms with an area in other phases",
+    "rooms_not_enclosed": "Located rooms without an area",
+    "rooms_unplaced": "Rooms without a location",
+    "rooms_with_id": "Rooms with a Craydl ID in any phase",
+    "new_items": "Items created in {phase} and not demolished",
+    "new_products": "Of those, products",
+    "new_nested_parts": "Of those, parts nested in another family (not counted as products)",
+    "new_custom_items": "Of those, in-place items (not counted as products)",
+    "new_products_in_room": "Products with a room reference",
+    "new_products_with_number": "Products with a usable model number",
+    "new_products_with_link_only": "Products with a link but no usable model number",
+    "new_products_unidentified": "Products with neither a link nor a usable model number",
+    "materials_total": "Materials in the model",
+    "materials_used_new": "Materials used in {phase}",
+    "skipped_elements": "Elements that could not be read",
+    "rooms": "Rooms",
+    "products": "Products",
+    "shared_parameters": "Shared parameters",
+}
+NO_FINDINGS = "Nothing needs attention."
+
+# IronPython dicts do not preserve insertion order.
+_MODEL_SUMMARY_ORDER = [
     "rooms_placed",
     "rooms_placed_other_phases",
     "rooms_not_enclosed",
     "rooms_unplaced",
+    "rooms_with_id",
     "phases",
     "new_items",
     "new_products",
+    "new_nested_parts",
+    "new_custom_items",
     "new_products_in_room",
     "new_products_with_number",
     "new_products_with_link_only",
@@ -73,7 +104,7 @@ _MODEL_LABELS = [
     "materials_used_new",
     "skipped_elements",
 ]
-_TEMPLATE_LABELS = [
+_TEMPLATE_SUMMARY_ORDER = [
     "rooms",
     "products",
     "materials_total",
@@ -108,6 +139,7 @@ _SHAPE = {
     "rooms": [
         {
             "unique_id": "text",
+            "element_id": "integer",
             "name": "text",
             "number": "text",
             "level": "text",
@@ -120,6 +152,9 @@ _SHAPE = {
     "items": [
         {
             "unique_id": "text",
+            "element_id": "integer",
+            "nested": "bool",
+            "in_place": "bool",
             "category": "text",
             "family": "text",
             "type": "text",
@@ -239,45 +274,244 @@ def is_new(item, phase):
     return item["created_phase"] == phase and item["demolished_phase"] == ""
 
 
+def is_nested_part(item):
+    return item["nested"]
+
+
+def is_custom_item(item):
+    return (
+        item["category"] in PRODUCT_CATEGORIES
+        and not is_nested_part(item)
+        and item["in_place"]
+    )
+
+
 def is_product(item):
-    return item["category"] in PRODUCT_CATEGORIES
+    return (
+        item["category"] in PRODUCT_CATEGORIES
+        and not is_nested_part(item)
+        and not item["in_place"]
+    )
 
 
 def usable_model(model):
     return seed.normalize(model) not in _UNUSABLE_NUMBERS
 
 
-def _finding(findings, code, level, count, examples=(), preserve_order=False):
-    if count > 0:
-        examples = list(examples) if preserve_order else sorted(set(examples))
-        findings.append(
-            {
-                "code": code,
-                "level": level,
-                "count": count,
-                "text": TEXT[code],
-                "examples": examples[:10],
-            }
-        )
+def is_placeholder_type(product):
+    return seed.normalize(product["model"]) in ("na", "notatype") or (
+        seed.normalize(product["type"]).startswith("notatype")
+        and not usable_model(product["model"])
+    )
+
+
+def _finding(
+    findings, code, level, count, examples=(), elements=(), preserve_order=False
+):
+    if count <= 0:
+        return
+    if preserve_order:
+        distinct, seen = [], set()
+        for example in examples:
+            if example not in seen:
+                distinct.append(example)
+                seen.add(example)
+    else:
+        distinct = sorted(set(examples))
+    findings.append(
+        {
+            "code": code,
+            "level": level,
+            "count": count,
+            "text": TEXT[code],
+            "examples": distinct[:10],
+            "more": max(0, len(distinct) - 10),
+            "element_ids": sorted(set(element["element_id"] for element in elements))[
+                :50
+            ],
+        }
+    )
 
 
 def _repeated_materials(snapshot, findings):
     names = [
         row for row in snapshot["materials"]["repeated_names"] if row["count"] >= 100
     ]
-    # The snapshot already orders these by count descending, then name.
-    examples = []
-    for row in names:
-        example = "%s x%s" % (row["name"], row["count"])
-        if example not in examples:
-            examples.append(example)
-    _finding(findings, "repeated_materials", "note", len(names), examples, True)
+    _finding(
+        findings,
+        "repeated_materials",
+        "note",
+        len(names),
+        ("%s x%s" % (row["name"], row["count"]) for row in names),
+        preserve_order=True,
+    )
 
 
 def _room_label(room):
     return (
         "%s (%s)" % (room["name"], room["number"]) if room["number"] else room["name"]
     )
+
+
+def _room_name_key(room):
+    return seed.normalize(room["name"])
+
+
+def _groups(rows, key):
+    result = {}
+    for row in rows:
+        result.setdefault(key(row), []).append(row)
+    return result
+
+
+def _duplicate_groups(rows, key):
+    return [group for group in _groups(rows, key).values() if len(group) > 1]
+
+
+def _room_findings(findings, rooms, placed, chosen, set_up):
+    _finding(findings, "no_placed_rooms", "fix", int(not chosen))
+    starters, waiting, other = [], [], []
+    for room in rooms:
+        if is_placed(room):
+            continue
+        if room["stamp"]:
+            waiting.append(room)
+        elif _room_name_key(room) in STARTER_ROOM_NAMES:
+            starters.append(room)
+        else:
+            other.append(room)
+    _finding(
+        findings,
+        "starter_rooms",
+        "note",
+        len(starters),
+        (room["name"] for room in starters),
+        starters,
+    )
+    for code, level, group in (
+        ("rooms_waiting_to_be_placed", "note", waiting),
+        ("rooms_not_placed", "note", other),
+        (
+            "rooms_without_id",
+            "fix",
+            [r for r in chosen if not r["stamp"]] if set_up else [],
+        ),
+    ):
+        _finding(
+            findings, code, level, len(group), (_room_label(r) for r in group), group
+        )
+
+    unstamped_placed = _groups((r for r in placed if not r["stamp"]), _room_name_key)
+    pairs = []
+    for room in waiting:
+        twins = unstamped_placed.get(_room_name_key(room), ())
+        if len(twins) == 1:
+            pairs.append((room, twins[0]))
+    _finding(
+        findings,
+        "id_on_unplaced_room",
+        "fix",
+        len(pairs),
+        ("%s -> %s" % (_room_label(room), _room_label(twin)) for room, twin in pairs),
+        (room for pair in pairs for room in pair),
+    )
+
+    by_stamp = _duplicate_groups((r for r in rooms if r["stamp"]), lambda r: r["stamp"])
+    _finding(
+        findings,
+        "duplicate_room_id",
+        "fix",
+        len(by_stamp),
+        elements=(room for group in by_stamp for room in group),
+    )
+    by_name = _duplicate_groups(chosen, _room_name_key)
+    _finding(
+        findings,
+        "duplicate_room_names",
+        "note",
+        len(by_name),
+        (
+            "%s x%s" % (min(room["name"] for room in group), len(group))
+            for group in by_name
+        ),
+        (room for group in by_name for room in group),
+    )
+
+
+def _family_type(item):
+    return "%s: %s" % (item["family"], item["type"])
+
+
+def _category_label(item):
+    category = item["category"]
+    return category[4:] if category.startswith("OST_") else category
+
+
+def _counted_examples(rows, key):
+    counts = {}
+    for row in rows:
+        name = key(row)
+        counts[name] = counts.get(name, 0) + 1
+    return ("%s x%s" % (name, count) for name, count in counts.items())
+
+
+def _product_findings(findings, products, unnumbered, custom):
+    placeholder, named, unidentified = [], [], []
+    for product in unnumbered:
+        if is_placeholder_type(product):
+            placeholder.append(product)
+        elif product["manufacturer"] or product["url"]:
+            named.append(product)
+        else:
+            unidentified.append(product)
+    for code, level, group, key in (
+        (
+            "products_on_placeholder_type",
+            "fix",
+            placeholder,
+            lambda item: item["family"],
+        ),
+        ("products_named_without_number", "note", named, _family_type),
+        ("products_not_identified", "note", unidentified, _category_label),
+    ):
+        _finding(
+            findings, code, level, len(group), _counted_examples(group, key), group
+        )
+    _finding(
+        findings,
+        "custom_items",
+        "note",
+        len(custom),
+        (item["family"] for item in custom),
+        custom,
+    )
+    outside = [item for item in products if not item["room_unique_id"]]
+    _finding(
+        findings,
+        "products_outside_rooms",
+        "note",
+        len(outside),
+        _counted_examples(outside, _family_type),
+        outside,
+    )
+
+
+def _stage(findings, created_phases, placed, rooms_with_id):
+    counts = dict((row["code"], row["count"]) for row in findings)
+    args = ()
+    if "nothing_in_new_phase" in counts and created_phases:
+        code = "survey"
+    elif "not_linked" in counts or "not_set_up" in counts:
+        code = "not_linked"
+    elif "rooms_without_id" in counts:
+        code, args = "rooms_to_match", (counts["rooms_without_id"],)
+    elif "rooms_waiting_to_be_placed" in counts:
+        code, args = "rooms_to_place", (counts["rooms_waiting_to_be_placed"],)
+    elif not placed and not rooms_with_id:
+        code = "no_rooms"
+    else:
+        code = "ready"
+    return {"code": code, "text": STAGE_TEXT[code] % args}
 
 
 def model_report(snapshot, new_phase):
@@ -287,15 +521,16 @@ def model_report(snapshot, new_phase):
     chosen = [room for room in placed if room["phase"] == new_phase]
     new_items = [item for item in items if is_new(item, new_phase)]
     products = [item for item in new_items if is_product(item)]
-    numbered = [item for item in products if usable_model(item["model"])]
-    link_only = [
-        item for item in products if not usable_model(item["model"]) and item["url"]
-    ]
+    unnumbered = [item for item in products if not usable_model(item["model"])]
+    link_only = sum(1 for item in unnumbered if item["url"])
+    custom = [item for item in new_items if is_custom_item(item)]
+    rooms_with_id = sum(1 for room in rooms if room["stamp"])
     summary = {
         "rooms_placed": len(chosen),
         "rooms_placed_other_phases": len(placed) - len(chosen),
         "rooms_not_enclosed": sum(1 for room in rooms if is_not_enclosed(room)),
         "rooms_unplaced": sum(1 for room in rooms if is_unplaced(room)),
+        "rooms_with_id": rooms_with_id,
         "phases": [
             {
                 "name": phase,
@@ -316,10 +551,12 @@ def model_report(snapshot, new_phase):
         ],
         "new_items": len(new_items),
         "new_products": len(products),
+        "new_nested_parts": sum(1 for item in new_items if is_nested_part(item)),
+        "new_custom_items": len(custom),
         "new_products_in_room": sum(1 for item in products if item["room_unique_id"]),
-        "new_products_with_number": len(numbered),
-        "new_products_with_link_only": len(link_only),
-        "new_products_unidentified": len(products) - len(numbered) - len(link_only),
+        "new_products_with_number": len(products) - len(unnumbered),
+        "new_products_with_link_only": link_only,
+        "new_products_unidentified": len(unnumbered) - link_only,
         "materials_total": snapshot["materials"]["total"],
         "materials_used_new": sum(
             1
@@ -337,78 +574,19 @@ def model_report(snapshot, new_phase):
         "fix",
         int(not params.is_job_id(snapshot["model"]["job_id"])),
     )
-    _finding(findings, "no_placed_rooms", "fix", int(not chosen))
-    starters, other_unplaced = [], []
-    for room in rooms:
-        if not is_placed(room):
-            if not room["stamp"] and seed.normalize(room["name"]) in STARTER_ROOM_NAMES:
-                starters.append(room)
-            else:
-                other_unplaced.append(room)
+    _room_findings(findings, rooms, placed, chosen, set_up)
+    created_phases = set(row["created_phase"] for row in items + hosts)
     _finding(
-        findings, "starter_rooms", "note", len(starters), [r["name"] for r in starters]
+        findings, "nothing_in_new_phase", "fix", int(new_phase not in created_phases)
     )
-    _finding(
-        findings,
-        "rooms_not_placed",
-        "note",
-        len(other_unplaced),
-        [_room_label(r) for r in other_unplaced],
-    )
-    _finding(
-        findings,
-        "rooms_without_id",
-        "fix",
-        sum(1 for r in chosen if not r["stamp"]) if set_up else 0,
-    )
-    stamps, names = {}, {}
-    for room in rooms:
-        if room["stamp"]:
-            stamps[room["stamp"]] = stamps.get(room["stamp"], 0) + 1
-        if is_placed(room):
-            key = (room["phase"], seed.normalize(room["name"]))
-            names.setdefault(key, []).append(room["name"])
-    _finding(
-        findings,
-        "duplicate_room_id",
-        "fix",
-        sum(1 for count in stamps.values() if count > 1),
-    )
-    groups = [group for group in names.values() if len(group) > 1]
-    _finding(
-        findings,
-        "duplicate_room_names",
-        "note",
-        len(groups),
-        ["%s x%s" % (min(group), len(group)) for group in groups],
-    )
-    _finding(
-        findings,
-        "nothing_in_new_phase",
-        "fix",
-        int(
-            not any(element["created_phase"] == new_phase for element in items + hosts)
-        ),
-    )
-    outside = (
-        [item for item in products if not item["room_unique_id"]] if placed else []
-    )
-    categories = {}
-    for item in outside:
-        category = item["category"]
-        categories[category] = categories.get(category, 0) + 1
-    _finding(
-        findings,
-        "products_outside_rooms",
-        "fix",
-        len(outside),
-        ["%s x%s" % (c, n) for c, n in categories.items()],
-    )
-    _finding(findings, "products_without_number", "note", len(products) - len(numbered))
+    # A host without a readable phase is not evidence of work in another phase.
+    created_phases.discard("")
+    _product_findings(findings, products, unnumbered, custom)
     _repeated_materials(snapshot, findings)
     return {
         "mode": "model",
         "new_phase": new_phase,
+        "stage": _stage(findings, created_phases, placed, rooms_with_id),
         "summary": summary,
         "findings": findings,
     }
@@ -426,7 +604,6 @@ def template_report(snapshot):
         "skipped_elements": snapshot["counts"]["skipped_elements"],
     }
     findings = []
-    _finding(findings, "not_set_up", "fix", int(not snapshot["model"]["set_up"]))
     _finding(findings, "template_linked", "fix", int(snapshot["model"]["job_id"] != ""))
     _finding(
         findings, "template_room_ids", "fix", sum(1 for room in rooms if room["stamp"])
@@ -445,16 +622,19 @@ def template_report(snapshot):
     return {"mode": "template", "summary": summary, "findings": findings}
 
 
-def format_report(report, title):
-    """Return ordered printable lines, independent of dict iteration order."""
+def summary_lines(report, title):
+    """Return the heading, stage (model only), and ordered summary lines."""
     template = report["mode"] == "template"
     lines = ["Craydl Check %s: %s" % ("Template" if template else "Model", title)]
-    for label in _TEMPLATE_LABELS if template else _MODEL_LABELS:
-        value = report["summary"][label]
-        if label == "phases":
+    phase_name = report.get("new_phase", "")
+    if not template:
+        lines.append("Stage: %s" % report["stage"]["text"])
+    for key in _TEMPLATE_SUMMARY_ORDER if template else _MODEL_SUMMARY_ORDER:
+        value = report["summary"][key]
+        if key == "phases":
             for phase in value:
                 lines.append(
-                    "phase %s: items created %s, demolished %s; hosts created %s, demolished %s"
+                    "%s: items created %s, demolished %s; walls, floors, ceilings and roofs created %s, demolished %s"
                     % (
                         phase["name"],
                         phase["items_created"],
@@ -464,21 +644,29 @@ def format_report(report, title):
                     )
                 )
         else:
-            lines.append("%s: %s" % (label, value))
+            lines.append("%s: %s" % (LABELS[key].replace("{phase}", phase_name), value))
+    return lines
+
+
+def finding_lines(finding):
+    lines = [
+        "%s | %s | %s" % (finding["level"].upper(), finding["count"], finding["text"])
+    ]
+    if finding["examples"]:
+        examples = "   " + ", ".join(finding["examples"])
+        if finding["more"]:
+            examples += " and %s more" % finding["more"]
+        lines.append(examples)
+    return lines
+
+
+def format_report(report, title):
+    """Return printable lines without any host-specific selection links."""
+    lines = summary_lines(report, title)
     for finding in report["findings"]:
-        lines.append(
-            "%s | %s | %s | %s"
-            % (
-                finding["level"].upper(),
-                finding["code"],
-                finding["count"],
-                finding["text"],
-            )
-        )
-        if finding["examples"]:
-            lines.append("   e.g. " + ", ".join(finding["examples"]))
+        lines.extend(finding_lines(finding))
     if not report["findings"]:
-        lines.append("Nothing needs attention.")
+        lines.append(NO_FINDINGS)
     return lines
 
 

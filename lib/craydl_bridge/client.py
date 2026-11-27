@@ -5,6 +5,10 @@ from __future__ import unicode_literals
 import json
 
 
+_TEXT_TYPES = (type(""), str)
+_UNCERTAIN_WRITE = "Craydl may have made the write. Check before trying again."
+
+
 class CraydlError(Exception):
     """A safe-to-display bridge failure with a stable category."""
 
@@ -127,6 +131,30 @@ class CraydlClient(object):
                 )
             self._initialized = True
 
+    def list_tools(self):
+        """Return all advertised tool names, or raise without returning a partial set."""
+        self.initialize()
+        names = set()
+        params = {}
+        for unused in range(20):
+            page = self._request("tools/list", params)
+            tools = page.get("tools")
+            if not isinstance(tools, list):
+                raise CraydlError("protocol", "Invalid tool list.")
+            for tool in tools:
+                if not isinstance(tool, dict) or not isinstance(
+                    tool.get("name"), _TEXT_TYPES
+                ):
+                    raise CraydlError("protocol", "Invalid tool name in the list.")
+                names.add(tool["name"])
+            cursor = page.get("nextCursor")
+            if cursor is None:
+                return names
+            if not isinstance(cursor, _TEXT_TYPES):
+                raise CraydlError("protocol", "Invalid cursor in the tool list.")
+            params = {"cursor": cursor}
+        raise CraydlError("incomplete", "The tool list exceeded the page safety limit.")
+
     def call_tool(self, name, arguments):
         self.initialize()
         result = self._request("tools/call", {"name": name, "arguments": arguments})
@@ -137,6 +165,57 @@ class CraydlClient(object):
         if result.get("isError") is True:
             raise self._tool_error(text)
         return self._parse_json(text)
+
+    def _call_write(self, name, arguments, states):
+        try:
+            reply = self.call_tool(name, arguments)
+        except CraydlError as error:
+            if error.code == "tool_error":
+                try:
+                    payload = json.loads(error.args[0])
+                except (ValueError, TypeError):
+                    pass  # Unstructured errors do not prove a refusal.
+                else:
+                    if (
+                        not isinstance(payload, dict)
+                        or payload.get("code") != "unavailable"
+                    ):
+                        raise
+            elif error.code not in ("http", "protocol"):
+                raise
+        else:
+            if isinstance(reply, dict) and reply.get("state") in states:
+                return reply
+        # Do not chain an exception from the request, and never retry the write.
+        raise CraydlError("uncertain", _UNCERTAIN_WRITE)
+
+    def write(self, name, arguments):
+        """Execute a direct write or confirm one matching proposal, without retries."""
+        reply = self._call_write(name, arguments, ("proposed", "executed"))
+        if reply["state"] == "executed":
+            return reply
+
+        action_id = reply.get("action_id")
+        target = reply.get("target")
+        if not isinstance(action_id, _TEXT_TYPES) or not isinstance(target, dict):
+            raise CraydlError("uncertain", _UNCERTAIN_WRITE)
+        # CD4A binds a room proposal to the job the modeler saw before Apply.
+        if name == "create_job_room":
+            job_id = target.get("job_id")
+            if not isinstance(job_id, _TEXT_TYPES) or job_id != arguments.get("job_id"):
+                raise CraydlError(
+                    "protocol", "The room proposal did not name the requested job."
+                )
+        for key, value in target.items():
+            if (
+                isinstance(value, _TEXT_TYPES)
+                and key in arguments
+                and value != arguments[key]
+            ):
+                raise CraydlError(
+                    "protocol", "The proposal target did not match the request."
+                )
+        return self._call_write(name, {"action_id": action_id}, ("executed",))
 
     def read_all(self, name, arguments, page_limit=50, max_pages=20):
         if page_limit < 1 or max_pages < 1:

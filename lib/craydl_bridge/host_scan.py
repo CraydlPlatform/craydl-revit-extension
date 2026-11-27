@@ -10,6 +10,7 @@ from Autodesk.Revit.DB import (
     BuiltInParameter,
     CategoryType,
     Element,
+    ElementId,
     FamilyInstance,
     FilteredElementCollector,
     Material,
@@ -20,6 +21,10 @@ from Autodesk.Revit.DB import (
 )
 
 from craydl_bridge import __version__, check, host, params
+
+
+def element_ids(values):
+    return [ElementId(value) for value in values]
 
 
 def is_template_path(path):
@@ -78,6 +83,8 @@ def _room(doc, room):
     phase = doc.GetElement(phase_id)
     return {
         "unique_id": room.UniqueId,
+        # IronPython exposes ElementId.Value as a boxed Int64.
+        "element_id": int(room.Id.Value),
         "name": _text(room, BuiltInParameter.ROOM_NAME),
         "number": room.Number or "",
         "level": (level.Name or "") if level is not None else "",
@@ -97,6 +104,9 @@ def _item(element, phases, phase_names):
     symbol = element.Symbol
     return {
         "unique_id": element.UniqueId,
+        "element_id": int(element.Id.Value),
+        "nested": element.SuperComponent is not None,
+        "in_place": bool(symbol.Family.IsInPlace),
         "category": _category(element),
         "family": symbol.FamilyName or "",
         "type": Element.Name.GetValue(symbol) or "",

@@ -197,7 +197,7 @@ def _definitions(app, rows):
 
 
 def in_transaction(doc, name, edit):
-    """All writes are atomic, including false Set/Insert or failed Commit results."""
+    """Run an atomic edit; a callback returning False requests rollback."""
     require_project(doc)
     transaction = Transaction(doc, name)
     try:
@@ -208,7 +208,10 @@ def in_transaction(doc, name, edit):
         # Keep failure processing synchronous (no modeless Pending commit).
         options.SetForcedModalHandling(True)
         transaction.SetFailureHandlingOptions(options)
-        edit()
+        if edit() is False:
+            if transaction.RollBack() != TransactionStatus.RolledBack:
+                raise ValueError("Revit did not roll back the edit.")
+            return
         if transaction.Commit() != TransactionStatus.Committed:
             raise ValueError("Revit did not commit the edit.")
     except Exception:
@@ -219,45 +222,53 @@ def in_transaction(doc, name, edit):
         transaction.Dispose()
 
 
-def set_up_model(doc):
-    """Recompute on application; a conflict stops before any transaction."""
-    require_project(doc)
-    existing = _bindings(doc)
+def binding_changes(existing):
+    """Read-only preview of required changes; a name conflict stops either button."""
     plan = params.binding_plan(existing)
-    for row in plan:
-        if row["action"] == "name_conflict":
-            raise ValueError("Parameter name conflict: %s" % row["name"])
-    changes = [row for row in plan if row["action"] != "ok"]
+    conflicts = [row["name"] for row in plan if row["action"] == "name_conflict"]
+    if conflicts:
+        raise ValueError(
+            "Parameter name conflict: %s\nA different or non-shared parameter has this "
+            "name. Ask your model manager to resolve the conflict."
+            % ", ".join(conflicts)
+        )
+    return [row for row in plan if row["action"] != "ok"]
+
+
+def bind_missing_parameters(doc, confirmed):
+    """Apply the confirmed binding changes inside the caller's transaction."""
+    existing = _bindings(doc)
+    changes = binding_changes(existing)
+    if changes != confirmed:
+        raise ValueError("The Craydl parameter bindings changed. Preview the edit again.")
     if not changes:
         return False
 
-    def edit():
-        app = doc.Application
-        new_rows = [r for r in changes if r["action"] == "bind"]
-        definitions = _definitions(app, new_rows) if new_rows else {}
-        for row in changes:
-            categories = app.Create.NewCategorySet()
-            previous = next((r for r in existing if r["guid"] == row["guid"]), None)
-            if previous:
-                for category in previous["binding"].Categories:
-                    categories.Insert(category)
-                definition = previous["definition"]
-            else:
-                definition = definitions[row["guid"]]
-            for name in row["categories"]:
-                categories.Insert(
-                    doc.Settings.Categories.get_Item(getattr(BuiltInCategory, name))
-                )
-            binding = app.Create.NewInstanceBinding(categories)
-            method = (
-                doc.ParameterBindings.ReInsert
-                if previous
-                else doc.ParameterBindings.Insert
+    app = doc.Application
+    new_rows = [row for row in changes if row["action"] == "bind"]
+    definitions = _definitions(app, new_rows) if new_rows else {}
+    for row in changes:
+        categories = app.Create.NewCategorySet()
+        previous = next((r for r in existing if r["guid"] == row["guid"]), None)
+        if previous:
+            for category in previous["binding"].Categories:
+                categories.Insert(category)
+            definition = previous["definition"]
+        else:
+            definition = definitions[row["guid"]]
+        for name in row["categories"]:
+            categories.Insert(
+                doc.Settings.Categories.get_Item(getattr(BuiltInCategory, name))
             )
-            if not method(definition, binding, GroupTypeId.IdentityData):
-                raise ValueError("Revit refused to bind %s." % row["name"])
+        binding = app.Create.NewInstanceBinding(categories)
+        method = (
+            doc.ParameterBindings.ReInsert if previous else doc.ParameterBindings.Insert
+        )
+        if not method(definition, binding, GroupTypeId.IdentityData):
+            raise ValueError("Revit refused to bind %s." % row["name"])
 
-    in_transaction(doc, "Craydl: set up model", edit)
+    # Make the new parameters visible on elements before stamping them.
+    doc.Regenerate()
     return True
 
 
@@ -270,7 +281,7 @@ def write_stamp(element, guid, text):
     """Caller owns the transaction; a refused edit must never look successful."""
     parameter = element.get_Parameter(Guid(guid))
     if parameter is None:
-        raise ValueError("Craydl parameter is missing. Run Set Up Model first.")
+        raise ValueError("The Craydl parameter is not available on this element.")
     if parameter.IsReadOnly:
         raise ValueError(
             "Revit refused the edit: Project Information or the element may be owned "
@@ -290,11 +301,15 @@ def phase_names(doc):
 
 def _room_record(doc, room):
     phase_id = room.get_Parameter(BuiltInParameter.ROOM_PHASE).AsElementId()
+    level = doc.GetElement(room.LevelId)
+    located = room.Location is not None
     return {
         "element_id": room.Id.Value,
         "name": room.get_Parameter(BuiltInParameter.ROOM_NAME).AsString() or "",
         "number": room.Number or "",
-        "placed": room.Location is not None,
+        "located": located,
+        "level": level.Name if level is not None else "",
+        "area_sf": round(room.Area, 1),
         "phase": doc.GetElement(phase_id).Name,
         "stamp": read_stamp(room, params.PARAMETERS[1]["guid"]) or "",
     }
@@ -310,56 +325,81 @@ def read_model_rooms(doc):
     ]
 
 
-def apply_seed(doc, phase_name, rows):
-    """One undo step, isolated row failures, and no partial orphan creations."""
+def _unstamped_model_room(doc, element_id, guid):
+    room = doc.GetElement(ElementId(element_id))
+    if room is None:
+        raise ValueError("The model room no longer exists.")
+    if read_stamp(room, guid):
+        raise ValueError("The model room now has a Craydl ID. Run Match Rooms again.")
+    return room
+
+
+def apply_rooms(doc, phase_name, actions, confirmed_bindings):
+    """Apply checked Match Rooms actions in one undo step, atomically per row."""
     require_project(doc)
     if editing_design_option(doc):
-        raise ValueError("Finish editing the design option before using Seed Rooms.")
-    if any(row["action"] not in ("create", "link") for row in rows):
-        raise ValueError("Only create and link rows can be applied.")
-    result = {"created": [], "linked": [], "skipped": []}
-    if not rows:
+        raise ValueError("Finish editing the design option before using Match Rooms.")
+    keys = {"create": "created", "link": "linked", "move": "moved"}
+    allowed = tuple(keys)
+    if any(action.get("action") not in allowed for action in actions):
+        raise ValueError("Only create, link and move rows can be applied.")
+    result = {"created": [], "linked": [], "moved": [], "skipped": []}
+    if not actions:
         return result
     phase = next((p for p in doc.Phases if p.Name == phase_name), None)
     if phase is None:
-        raise ValueError("The selected phase no longer exists. Run Seed Rooms again.")
+        raise ValueError("The selected phase no longer exists. Run Match Rooms again.")
+
+    guid = params.PARAMETERS[1]["guid"]
 
     def edit():
-        for row in rows:
-            # A failed stamp must also remove a just-created room. Subtransactions
-            # isolate rows but remain inside the single named undo transaction.
+        bound_fields = bind_missing_parameters(doc, confirmed_bindings)
+        for action in actions:
+            kind = action["action"]
             sub = SubTransaction(doc)
             try:
                 if sub.Start() != TransactionStatus.Started:
                     raise ValueError("Revit could not start this room edit.")
-                if row["action"] == "create":
+                room_id = action["room"]["id"]
+                if kind == "create":
                     room = doc.Create.NewRoom(phase)
                     if not room.get_Parameter(BuiltInParameter.ROOM_NAME).Set(
-                        row["room"]["display_name"]
+                        action["room"]["display_name"]
                     ):
                         raise ValueError("Revit refused to set the new room's name.")
+                    write_stamp(room, guid, room_id)
+                    edited = [room]
+                elif kind == "link":
+                    room = _unstamped_model_room(doc, action["element_id"], guid)
+                    write_stamp(room, guid, room_id)
+                    if action["rename"] and not room.get_Parameter(
+                        BuiltInParameter.ROOM_NAME
+                    ).Set(action["room"]["display_name"]):
+                        raise ValueError("Revit refused to rename the model room.")
+                    edited = [room]
                 else:
-                    room = doc.GetElement(
-                        ElementId(row["model_rooms"][0]["element_id"])
-                    )
-                    if room is None:
-                        raise ValueError("The existing room no longer exists.")
-                    if read_stamp(room, params.PARAMETERS[1]["guid"]):
+                    source = doc.GetElement(ElementId(action["from_element_id"]))
+                    if source is None or read_stamp(source, guid) != room_id:
                         raise ValueError(
-                            "The existing room is now stamped. Run Seed Rooms again."
+                            "The Craydl ID is no longer on that room. Run Match Rooms again."
                         )
-                write_stamp(room, params.PARAMETERS[1]["guid"], row["room"]["id"])
-                record = _room_record(doc, room)
+                    target = _unstamped_model_room(doc, action["to_element_id"], guid)
+                    # Both writes belong to this row: a refusal restores the source.
+                    write_stamp(source, guid, "")
+                    write_stamp(target, guid, room_id)
+                    edited = [source, target]
+                records = [_room_record(doc, room) for room in edited]
                 if sub.Commit() != TransactionStatus.Committed:
                     raise ValueError("Revit did not commit this room edit.")
-                key = "created" if row["action"] == "create" else "linked"
-                result[key].append({"room": row["room"], "model_rooms": [record]})
+                result[keys[kind]].append({"action": action, "model_rooms": records})
             except Exception as error:
                 if sub.GetStatus() == TransactionStatus.Started:
                     sub.RollBack()
-                result["skipped"].append({"row": row, "reason": "%s" % error})
+                result["skipped"].append({"action": action, "reason": "%s" % error})
             finally:
                 sub.Dispose()
+        if bound_fields and not any(result[key] for key in keys.values()):
+            return False
 
-    in_transaction(doc, "Craydl: seed rooms", edit)
+    in_transaction(doc, "Craydl: match rooms", edit)
     return result
